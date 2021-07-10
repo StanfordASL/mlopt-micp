@@ -58,6 +58,7 @@ class CoCo_FF(Solver):
         """
         self.n_features = n_features
         self.strategy_dict = {}
+        self.binary_dict = {}
 
         p_train = train_data[0]
         obs_train = p_train['obstacles']
@@ -66,17 +67,8 @@ class CoCo_FF(Solver):
         for k in p_train.keys():
             self.num_train = len(p_train[k])
 
-        ## TODO(acauligi): add support for combining p_train & p_test correctly
-        ## to be able to generate strategies for train and test params here
-        # p_test = None
-        # x_test = None
-        # y_test = np.empty((*y_train.shape[:-1], 0))   # Assumes y_train is 3D tensor
-        # if test_data:
-        #   p_test, y_test = test_data[:2]
-        #   for k in p_test.keys():
-        #     self.num_test = len(p_test[k])
-        # num_probs = self.num_train + self.num_test
-        # self.Y = np.dstack((Y_train, Y_test))         # Stack Y_train and Y_test along dim=2
+        T = int(x_train.shape[1] / (2*self.problem.n))
+
         num_probs = self.num_train
         params = p_train
         self.Y = y_train
@@ -92,26 +84,29 @@ class CoCo_FF(Solver):
         self.n_strategies = 0
 
         for ii in range(num_probs):
-            obs_strats = self.problem.which_M(x_train[ii], obs_train[ii])
+            for jj in range(T):
+                x_sol = x_train[ii, 2*self.problem.n*jj:2*self.problem.n*(jj+1), :]
+                obs_strats = self.problem.which_M(x_sol, obs_train[ii])
 
-            prob_params = {}
-            for k in params:
-                prob_params[k] = params[k][ii]
+                prob_params = {}
+                for k in params:
+                    prob_params[k] = params[k][ii]
 
-            for ii_obs in range(self.problem.n_obs):
-                # TODO(acauligi): check if transpose necessary with new pickle save format for Y
-                y_true = np.reshape(self.Y[ii, 4*ii_obs:4*(ii_obs+1),:], (self.n_y))
-                obs_strat = tuple(obs_strats[ii_obs])
+                for ii_obs in range(self.problem.n_obs):
+                    # TODO(acauligi): check if transpose necessary with new pickle save format for Y
+                    y_true = np.reshape(self.Y[ii, 4*ii_obs:4*(ii_obs+1),:], (self.n_y))
+                    obs_strat = tuple(obs_strats[ii_obs])
 
-                if obs_strat not in self.strategy_dict.keys():
-                    self.strategy_dict[obs_strat] = np.hstack((self.n_strategies, np.copy(y_true)))
-                    self.n_strategies += 1
+                    if obs_strat not in self.strategy_dict.keys():
+                        self.strategy_dict[obs_strat] = np.hstack((self.n_strategies, y_true))
+                        self.binary_dict[self.n_strategies] = y_true
+                        self.n_strategies += 1
 
-                self.labels[ii*self.problem.n_obs+ii_obs] = self.strategy_dict[obs_strat]
+                    self.labels[ii*self.problem.n_obs+ii_obs] = self.strategy_dict[obs_strat]
 
-                self.features[ii*self.problem.n_obs+ii_obs] = self.problem.construct_features(prob_params, self.prob_features, ii_obs=ii_obs if 'obstacles' in self.prob_features else None)
-                if "obstacles_map" in self.prob_features:
-                    self.cnn_features_idx[ii*self.problem.n_obs+ii_obs] = np.array([ii,ii_obs], dtype=int)
+                    self.features[ii*self.problem.n_obs+ii_obs] = self.problem.construct_features(prob_params, self.prob_features, ii_obs=ii_obs if 'obstacles' in self.prob_features else None)
+                    if "obstacles_map" in self.prob_features:
+                        self.cnn_features_idx[ii*self.problem.n_obs+ii_obs] = np.array([ii,ii_obs], dtype=int)
 
     def setup_network(self, depth=3, neurons=128, device_id=0):
         if device_id == -1:
@@ -166,7 +161,7 @@ class CoCo_FF(Solver):
         model.to(device=self.device)
         writer = SummaryWriter("{}".format(summary_writer_fn))
 
-        X = self.features[:self.problem.n_obs*self.num_train]
+        X = self.features
         X_cnn = None
         if 'obstacles_map' in self.prob_features:
             # X_cnn = self.cnn_features[:self.problem.n_obs*self.num_train]
@@ -182,7 +177,7 @@ class CoCo_FF(Solver):
         for epoch in range(TRAINING_ITERATIONS):  # loop over the dataset multiple times
             t0 = time.time()
             running_loss = 0.0
-            rand_idx = list(np.arange(0,X.shape[0]-1))
+            rand_idx = list(np.arange(0, X.shape[0]-1))
             random.shuffle(rand_idx)
 
             # Sample all data points
@@ -300,13 +295,8 @@ class CoCo_FF(Solver):
         obs_strats = {}
         uniq_idxs = np.unique(ind_max)
 
-        for ii,idx in enumerate(uniq_idxs):
-            for jj in range(self.labels.shape[0]):
-                # first index of training label is that strategy's idx
-                label = self.labels[jj]
-                if label[0] == idx:
-                    # remainder of training label is that strategy's binary pin
-                    obs_strats[idx] = label[1:]
+        for ii, idx in enumerate(uniq_idxs):
+            obs_strats[idx] = self.binary_dict[idx]
 
         # Generate Cartesian product of strategy combinations
         vv = [np.arange(0,self.n_evals) for _ in range(self.problem.n_obs)]
